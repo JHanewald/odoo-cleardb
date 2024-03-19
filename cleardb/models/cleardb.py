@@ -9,12 +9,12 @@ from odoo import _, api, fields, models, SUPERUSER_ID
 from odoo.exceptions import UserError, RedirectWarning, ValidationError
 import logging
 from odoo.tools.sql import table_exists
+from odoo.tools.sql import column_exists
 from odoo.tools import config
 from odoo.modules import load_information_from_description_file
 from odoo.tools import DEFAULT_SERVER_DATETIME_FORMAT
 from odoo.tools import DEFAULT_SERVER_DATE_FORMAT
 from contextlib import closing
-from odoo.tools import table_exists
 import threading
 
 logger = logging.getLogger("cleardb")
@@ -38,17 +38,6 @@ class JustDelete(Exception):
 
 class ClearDB(models.AbstractModel):
     _name = "frameworktools.cleardb"
-
-    _complete_clear = [
-        "queue.job",
-        "mail.followers",
-        "mail_followers_mail_message_subtype_rel",
-        "bus.bus",
-        "auditlog.log",
-        "auditlog.log.line",
-        "mail_message",
-        "ir_attachment",
-    ]
 
     @api.model
     def _run(self, no_vacuum_full=False):
@@ -106,6 +95,10 @@ class ClearDB(models.AbstractModel):
         for table in self._yield_fields("_complete_clear"):
             yield (table, True)
 
+        for model in self.env["ir.model"].sudo().search([("clear_db", "=", True)]):
+            obj = self.env[model.model]
+            yield (obj._table, True)
+
     @api.model
     def _get_clear_fields(self):
         yield from [x.split(":") for x in self._yield_fields("_nullify_columns")]
@@ -117,6 +110,12 @@ class ClearDB(models.AbstractModel):
                 if not hasattr(objfield, "cleardb"):
                     continue
                 yield (obj._table, field)
+
+        for objfield in (
+            self.env["ir.model.fields"].sudo().search([("clear_db", "=", True)])
+        ):
+            obj = self.env[objfield.model_id.model]
+            yield (obj._table, objfield.name)
 
     @api.model
     def _clear_custom_functions(self):
@@ -152,7 +151,22 @@ class ClearDB(models.AbstractModel):
                     self._delete_table(table, cleardb)
                 except psycopg2.Error as ex:
                     raise ValidationError(f"It fails here: delete from {table}: {ex}")
+            self._on_clear_table(table)
 
+    @api.model
+    def _on_clear_table(self, tablename):
+        if tablename == "ir_attachment":
+            breakpoint()
+            self.env.cr.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema='public';"
+            )
+            all_tables = self.env.cr.fetchall()
+            for table in all_tables:
+                if column_exists(self.env.cr, tablename, "message_main_attachment_id"):
+                    self.env.cr.execute(
+                        f"update {tablename} " "set message_main_attachment_id=null "
+                    )
 
     @api.model
     def _simple_delete_table(self, table, where, disable_constraints=True):
@@ -162,7 +176,9 @@ class ClearDB(models.AbstractModel):
             self.env.cr.execute(f"alter table {table} enable trigger all;")
 
     @api.model
-    def _delete_table(self, table, cleardb, workers=50, tuple_size=300, disable_constraints=True):
+    def _delete_table(
+        self, table, cleardb, workers=50, tuple_size=300, disable_constraints=True
+    ):
         where = cleardb if isinstance(cleardb, str) else "1=1"
         for k, v in self._sql_params().items():
             where = where.replace(k, v)
@@ -197,14 +213,16 @@ class ClearDB(models.AbstractModel):
 
                             while True:
                                 try:
-                                    with cr.savepoint(), tools.mute_logger("odoo.sql_db"):
+                                    with cr.savepoint(), tools.mute_logger(
+                                        "odoo.sql_db"
+                                    ):
                                         cr.execute(
                                             f"delete from {table} where id in %s",
                                             (subbatch,),
                                         )
                                 except psycopg2.errors.SerializationFailure:
                                     cr.rollback()
-                                    time.sleep(random.randint(1,5))
+                                    time.sleep(random.randint(1, 5))
                                 else:
                                     break
                             cr.commit()
@@ -224,7 +242,7 @@ class ClearDB(models.AbstractModel):
     @api.model
     def _vacuum_table(self, table):
         self.env.cr.commit()
-        if self.env.context.get('no_vacuum_full'):
+        if self.env.context.get("no_vacuum_full"):
             return
         with closing(self.env.registry.cursor()) as cr_tmp:
             logger.info(f"vacuum full on {table}")
